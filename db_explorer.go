@@ -68,7 +68,26 @@ func (table *TableInfo) prepareRow() []interface{} {
 }
 
 func (table *TableInfo) prepareInsertQuery() string {
+	values := make([]string, len(table.Fields))
+	placeholders := make([]string, len(table.Fields))
+	for i, field := range table.Fields {
+		values[i] = field.Name
+		placeholders[i] = "?"
+	}
+	return fmt.Sprintf("insert into %s (%s) values (%s)", table.Name, strings.Join(values, ", "), strings.Join(placeholders, ", "))
+}
 
+func (table *TableInfo) prepareParameters(params map[string]interface{}) []interface{} {
+	fmt.Printf("preparing parameters %v\n", params)
+	result := make([]interface{}, len(table.Fields))
+	for i, field := range table.Fields {
+		if params[field.Name] == nil {
+			result[i] = nil
+		} else {
+			result[i] = params[field.Name]
+		}
+	}
+	return result
 }
 
 
@@ -197,7 +216,14 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 			}
 			table := tablesContext.Tables[tableName]
 			params := table.extractParams(request.Form)
-			insertRow(db, tablesContext.Tables[tableName], params)
+			result, err := insertRow(db, tablesContext.Tables[tableName], params)
+			if err != nil {
+				writer.WriteHeader(http.StatusInternalServerError)
+				println (err.Error())
+				return
+			}
+			resultBytes, _ := json.Marshal(map[string]interface{}{"response": map[string]interface{}{"id": result}})
+			writer.Write(resultBytes)
 		}
 	})
 	return serverMux, nil
@@ -244,8 +270,18 @@ func getTables(db *sql.DB) ([]string, error) {
 	return result, nil
 }
 
-func insertRow(db *sql.DB, table TableInfo, params map[string]interface{}) {
-
+func insertRow(db *sql.DB, table TableInfo, params map[string]interface{}) (int64, error) {
+	query := table.prepareInsertQuery()
+	println(query)
+	queryParams := table.prepareParameters(params)
+	fmt.Printf("parameters %v\n", queryParams)
+	res, err := db.Exec(query, queryParams...)
+	if err!=nil {
+		return 0, err
+	} else {
+		result, _ := res.LastInsertId()
+		return result, nil
+	}
 }
 
 func initContext(db *sql.DB) (*TablesContext, error) {
