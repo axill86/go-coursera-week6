@@ -77,15 +77,34 @@ func (table *TableInfo) prepareInsertQuery() string {
 	return fmt.Sprintf("insert into %s (%s) values (%s)", table.Name, strings.Join(values, ", "), strings.Join(placeholders, ", "))
 }
 
-func (table *TableInfo) prepareParameters(params map[string]interface{}) []interface{} {
+func (table *TableInfo) prepareUpdateQuery(params map[string]interface{}) string {
+	values := make([]string, 0)
+	for k := range params {
+		values = append(values, fmt.Sprintf("%s = ?", k) )
+	}
+	return fmt.Sprintf("update %s set %s where %s = ?", table.Name, strings.Join(values, ","),  table.Id)
+}
+
+func (table *TableInfo) prepareInsertParameters(params map[string]interface{}, skipId bool) []interface{} {
 	fmt.Printf("preparing parameters %v\n", params)
 	result := make([]interface{}, len(table.Fields))
 	for i, field := range table.Fields {
+		if table.Id == field.Name && skipId {
+			continue
+		}
 		if params[field.Name] == nil {
 			result[i] = nil
 		} else {
 			result[i] = params[field.Name]
 		}
+	}
+	return result
+}
+
+func (table *TableInfo) prepareUpdateParameters(params map[string]interface{})  []interface{} {
+	result := make([]interface{}, 0)
+	for _, v := range params {
+		result = append(result, v)
 	}
 	return result
 }
@@ -195,15 +214,42 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 				rows, err := getRow(db, tablesContext.Tables[table], id)
 				if err != nil {
 					writer.WriteHeader(http.StatusNotFound)
+					result, _ := json.Marshal(map[string]string {"error": "record not found"})
+					writer.Write(result)
 					return
 				}
 				result, err := json.Marshal(
-					map[string]interface{}{"response": map[string]interface{}{"records": rows}})
+					map[string]interface{}{"response": map[string]interface{}{"record": rows}})
 				writer.Write(result)
 
 			}
 		case http.MethodDelete:
 		case http.MethodPost:
+			path := request.URL.Path
+			fragments := strings.Split(path, "/")
+			tableName := fragments[1]
+			id := fragments[2]
+			if !tablesContext.containsTable(tableName) {
+				result, _ := json.Marshal(map[string]interface{}{"error": "unknown table"})
+				writer.WriteHeader(http.StatusNotFound)
+				writer.Write(result)
+				return
+			}
+			table := tablesContext.Tables[tableName]
+
+			decoder := json.NewDecoder(request.Body)
+			requestParams := make(map[string]interface{}, len(table.Fields))
+			decoder.Decode(&requestParams)
+			fmt.Printf("Got parameters %#v\n", requestParams)
+			table = tablesContext.Tables[tableName]
+			result, err := updateRow(db, table, id, requestParams)
+			if err != nil {
+				writer.WriteHeader(http.StatusInternalServerError)
+				println (err.Error())
+				return
+			}
+			resultBytes, _ := json.Marshal(map[string]interface{}{"response": map[string]interface{}{"updated": result}})
+			writer.Write(resultBytes)
 		case http.MethodPut:
 			path := request.URL.Path
 			fragments := strings.Split(path, "/")
@@ -215,8 +261,12 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 				return
 			}
 			table := tablesContext.Tables[tableName]
-			params := table.extractParams(request.Form)
-			result, err := insertRow(db, tablesContext.Tables[tableName], params)
+
+			decoder := json.NewDecoder(request.Body)
+			requestParams := make(map[string]interface{}, len(table.Fields))
+			decoder.Decode(&requestParams)
+			fmt.Printf("Got parameters %#v\n", requestParams)
+			result, err := insertRow(db, tablesContext.Tables[tableName], requestParams)
 			if err != nil {
 				writer.WriteHeader(http.StatusInternalServerError)
 				println (err.Error())
@@ -232,7 +282,9 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 func (table *TableInfo) extractParams(values url.Values) map[string]interface{} {
 	result := make(map[string]interface{})
 	for _, field := range table.Fields {
+		fmt.Printf("checking field %s\n with value %s\n ", field.Name, values[field.Name])
 		if len(values[field.Name])==0 {
+
 			result[field.Name] = nil
 		} else {
 			v, _ := field.getValueFromString(values[field.Name][0])
@@ -273,13 +325,28 @@ func getTables(db *sql.DB) ([]string, error) {
 func insertRow(db *sql.DB, table TableInfo, params map[string]interface{}) (int64, error) {
 	query := table.prepareInsertQuery()
 	println(query)
-	queryParams := table.prepareParameters(params)
+	queryParams := table.prepareInsertParameters(params, true)
 	fmt.Printf("parameters %v\n", queryParams)
 	res, err := db.Exec(query, queryParams...)
 	if err!=nil {
 		return 0, err
 	} else {
 		result, _ := res.LastInsertId()
+		return result, nil
+	}
+}
+
+func updateRow(db *sql.DB, table TableInfo, id interface{}, params map[string]interface{}) (int64, error) {
+	query := table.prepareUpdateQuery(params)
+	println(query)
+	queryParams := table.prepareUpdateParameters(params)
+	queryParams = append(queryParams, id)
+	fmt.Printf("parameters %v\n", queryParams)
+	res, err := db.Exec(query, queryParams...)
+	if err!=nil {
+		return 0, err
+	} else {
+		result, _ := res.RowsAffected()
 		return result, nil
 	}
 }
