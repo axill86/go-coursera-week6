@@ -5,30 +5,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
-	"net/url"
 )
 
 // тут вы пишете код
 // обращаю ваше внимание - в этом задании запрещены глобальные переменные
 
 type TablesContext struct {
-	Tables map[string]TableInfo
+	Tables     map[string]TableInfo
 	TableNames []string
 }
 type TableInfo struct {
-	Name string
-	Id string
+	Name   string
+	Id     string
 	Fields []FieldInfo
 }
 
 type FieldInfo struct {
-	Name string
-	Type string
+	Name     string
+	Type     string
+	Required bool
+	IsKey    bool
 }
 
-func (field *FieldInfo) getValueFromString( value string) (interface{}, error) {
+func (field *FieldInfo) getValueFromString(value string) (interface{}, error) {
 	var result interface{}
 	var err error
 	switch field.Type {
@@ -44,7 +46,7 @@ func (field *FieldInfo) getValueFromString( value string) (interface{}, error) {
 	return result, err
 }
 
-func (tablesCtxt *TablesContext) containsTable(table string) bool{
+func (tablesCtxt *TablesContext) containsTable(table string) bool {
 	_, ok := tablesCtxt.Tables[table]
 	return ok
 }
@@ -80,20 +82,27 @@ func (table *TableInfo) prepareInsertQuery() string {
 func (table *TableInfo) prepareUpdateQuery(params map[string]interface{}) string {
 	values := make([]string, 0)
 	for k := range params {
-		values = append(values, fmt.Sprintf("%s = ?", k) )
+		values = append(values, fmt.Sprintf("%s = ?", k))
 	}
-	return fmt.Sprintf("update %s set %s where %s = ?", table.Name, strings.Join(values, ","),  table.Id)
+	return fmt.Sprintf("update %s set %s where %s = ?", table.Name, strings.Join(values, ","), table.Id)
 }
 
-func (table *TableInfo) prepareInsertParameters(params map[string]interface{}, skipId bool) []interface{} {
+func (table *TableInfo) prepareDeleteQuery() string {
+	return fmt.Sprintf("delete from %s where %s = ?", table.Name, table.Id)
+}
+func (table *TableInfo) prepareInsertParameters(params map[string]interface{}) []interface{} {
 	fmt.Printf("preparing parameters %v\n", params)
 	result := make([]interface{}, len(table.Fields))
 	for i, field := range table.Fields {
-		if table.Id == field.Name && skipId {
+		if table.Id == field.Name {
 			continue
 		}
 		if params[field.Name] == nil {
-			result[i] = nil
+			if !field.Required {
+				result[i] = nil
+			} else {
+				result[i] = field.getDefaultValue()
+			}
 		} else {
 			result[i] = params[field.Name]
 		}
@@ -101,14 +110,59 @@ func (table *TableInfo) prepareInsertParameters(params map[string]interface{}, s
 	return result
 }
 
-func (table *TableInfo) prepareUpdateParameters(params map[string]interface{})  []interface{} {
+func (field *FieldInfo) getDefaultValue() interface{} {
+	switch field.Type {
+	case "varchar":
+		return ""
+	case "text":
+		return ""
+	case "int":
+		return 0
+	}
+	return nil
+}
+
+func (field *FieldInfo) validateField(value interface{}) error {
+	if value == nil && field.Required {
+		return fmt.Errorf("field %s have invalid type", field.Name)
+	}
+	switch value.(type) {
+	case float64:
+		if field.Type != "int" {
+			return fmt.Errorf("field %s have invalid type", field.Name)
+		}
+	case string:
+		if field.Type != "varchar" && field.Type != "text" {
+			return fmt.Errorf("field %s have invalid type", field.Name)
+		}
+	}
+
+	return nil
+}
+
+func (table *TableInfo) validateInputParameters(params map[string]interface{}, validateKey bool) error {
+
+	for _, field := range table.Fields {
+		if value, ok := params[field.Name]; ok {
+			if validateKey && field.IsKey {
+				return fmt.Errorf("field %s have invalid type", field.Name)
+			}
+			err := field.validateField(value)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (table *TableInfo) prepareUpdateParameters(params map[string]interface{}) []interface{} {
 	result := make([]interface{}, 0)
 	for _, v := range params {
 		result = append(result, v)
 	}
 	return result
 }
-
 
 func (table *TableInfo) transformRow(row []interface{}) map[string]interface{} {
 	item := make(map[string]interface{}, len(row))
@@ -177,18 +231,17 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 				if request.URL.Query().Get("limit") != "" {
 					limit, err = strconv.Atoi(request.URL.Query().Get("limit"))
 					if err != nil {
-						writer.WriteHeader(http.StatusBadRequest)
-						return
+						limit = 5
 					}
 				}
 				if request.URL.Query().Get("offset") != "" {
 					offset, err = strconv.Atoi(request.URL.Query().Get("offset"))
 					if err != nil {
-						writer.WriteHeader(http.StatusBadRequest)
-						return
+						offset = 0
 					}
 				}
 
+				fmt.Sprintf("limit %s offset %s\n", limit, offset)
 				rows, err := getRows(db, tablesContext.Tables[tableName], limit, offset)
 				if err != nil {
 					writer.WriteHeader(http.StatusInternalServerError)
@@ -214,7 +267,7 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 				rows, err := getRow(db, tablesContext.Tables[table], id)
 				if err != nil {
 					writer.WriteHeader(http.StatusNotFound)
-					result, _ := json.Marshal(map[string]string {"error": "record not found"})
+					result, _ := json.Marshal(map[string]string{"error": "record not found"})
 					writer.Write(result)
 					return
 				}
@@ -224,6 +277,25 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 
 			}
 		case http.MethodDelete:
+			path := request.URL.Path
+			fragments := strings.Split(path, "/")
+			tableName := fragments[1]
+			id := fragments[2]
+			if !tablesContext.containsTable(tableName) {
+				result, _ := json.Marshal(map[string]interface{}{"error": "unknown table"})
+				writer.WriteHeader(http.StatusNotFound)
+				writer.Write(result)
+				return
+			}
+			table := tablesContext.Tables[tableName]
+			result, err := deleteRow(db, table, id)
+			if err != nil {
+				writer.WriteHeader(http.StatusInternalServerError)
+				println(err.Error())
+				return
+			}
+			resultBytes, _ := json.Marshal(map[string]interface{}{"response": map[string]interface{}{"deleted": result}})
+			writer.Write(resultBytes)
 		case http.MethodPost:
 			path := request.URL.Path
 			fragments := strings.Split(path, "/")
@@ -236,16 +308,22 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 				return
 			}
 			table := tablesContext.Tables[tableName]
-
 			decoder := json.NewDecoder(request.Body)
 			requestParams := make(map[string]interface{}, len(table.Fields))
 			decoder.Decode(&requestParams)
+			validationError := table.validateInputParameters(requestParams, true)
+			if validationError != nil {
+				result, _ := json.Marshal(map[string]interface{}{"error": validationError.Error()})
+				writer.WriteHeader(http.StatusBadRequest)
+				writer.Write(result)
+				return
+			}
 			fmt.Printf("Got parameters %#v\n", requestParams)
 			table = tablesContext.Tables[tableName]
 			result, err := updateRow(db, table, id, requestParams)
 			if err != nil {
 				writer.WriteHeader(http.StatusInternalServerError)
-				println (err.Error())
+				println(err.Error())
 				return
 			}
 			resultBytes, _ := json.Marshal(map[string]interface{}{"response": map[string]interface{}{"updated": result}})
@@ -269,10 +347,10 @@ func NewDbExplorer(db *sql.DB) (http.Handler, error) {
 			result, err := insertRow(db, tablesContext.Tables[tableName], requestParams)
 			if err != nil {
 				writer.WriteHeader(http.StatusInternalServerError)
-				println (err.Error())
+				println(err.Error())
 				return
 			}
-			resultBytes, _ := json.Marshal(map[string]interface{}{"response": map[string]interface{}{"id": result}})
+			resultBytes, _ := json.Marshal(map[string]interface{}{"response": map[string]interface{}{table.Id: result}})
 			writer.Write(resultBytes)
 		}
 	})
@@ -283,7 +361,7 @@ func (table *TableInfo) extractParams(values url.Values) map[string]interface{} 
 	result := make(map[string]interface{})
 	for _, field := range table.Fields {
 		fmt.Printf("checking field %s\n with value %s\n ", field.Name, values[field.Name])
-		if len(values[field.Name])==0 {
+		if len(values[field.Name]) == 0 {
 
 			result[field.Name] = nil
 		} else {
@@ -296,8 +374,8 @@ func (table *TableInfo) extractParams(values url.Values) map[string]interface{} 
 
 func getRow(db *sql.DB, table TableInfo, id interface{}) (map[string]interface{}, error) {
 	query := fmt.Sprintf("select * from %s where %s = ?", table.Name, table.Id)
-	data:=table.prepareRow()
-	row:=db.QueryRow(query, id)
+	data := table.prepareRow()
+	row := db.QueryRow(query, id)
 	err := row.Scan(data...)
 	if err != nil {
 		return nil, err
@@ -325,10 +403,10 @@ func getTables(db *sql.DB) ([]string, error) {
 func insertRow(db *sql.DB, table TableInfo, params map[string]interface{}) (int64, error) {
 	query := table.prepareInsertQuery()
 	println(query)
-	queryParams := table.prepareInsertParameters(params, true)
+	queryParams := table.prepareInsertParameters(params)
 	fmt.Printf("parameters %v\n", queryParams)
 	res, err := db.Exec(query, queryParams...)
-	if err!=nil {
+	if err != nil {
 		return 0, err
 	} else {
 		result, _ := res.LastInsertId()
@@ -343,7 +421,7 @@ func updateRow(db *sql.DB, table TableInfo, id interface{}, params map[string]in
 	queryParams = append(queryParams, id)
 	fmt.Printf("parameters %v\n", queryParams)
 	res, err := db.Exec(query, queryParams...)
-	if err!=nil {
+	if err != nil {
 		return 0, err
 	} else {
 		result, _ := res.RowsAffected()
@@ -351,6 +429,16 @@ func updateRow(db *sql.DB, table TableInfo, id interface{}, params map[string]in
 	}
 }
 
+func deleteRow(db *sql.DB, table TableInfo, id interface{}) (int64, error) {
+	query := table.prepareDeleteQuery()
+	res, err := db.Exec(query, id)
+	if err != nil {
+		return 0, err
+	} else {
+		result, _ := res.RowsAffected()
+		return result, nil
+	}
+}
 func initContext(db *sql.DB) (*TablesContext, error) {
 	tables, err := getTables(db)
 	if err != nil {
@@ -360,33 +448,31 @@ func initContext(db *sql.DB) (*TablesContext, error) {
 	result.TableNames = tables
 	result.Tables = make(map[string]TableInfo, len(tables))
 	for _, table := range tables {
-		rows, err :=db.Query("SELECT column_name, if (column_key='PRI', true, false) as 'key', DATA_TYPE from information_schema.columns where  table_name = ? and table_schema=database()", table)
+		rows, err := db.Query("SELECT column_name, if (column_key='PRI', true, false) as 'key', DATA_TYPE, if(is_nullable='NO', true, false) as nullable from information_schema.columns where  table_name = ? and table_schema=database()", table)
 		if err != nil {
 			return nil, err
 		}
 		var keyName string
 		fields := make([]FieldInfo, 0)
 		for rows.Next() {
-			isKey := new(bool)
+
 			f := new(FieldInfo)
-			rows.Scan(&f.Name, isKey, &f.Type)
-			if *isKey {
+			rows.Scan(&f.Name, &f.IsKey, &f.Type, &f.Required)
+			if f.IsKey {
 				keyName = f.Name
 			}
 			fields = append(fields, *f)
 		}
 		fmt.Printf("%#v", fields)
 		result.Tables[table] = TableInfo{
-			Name:table,
-			Id:keyName,
-			Fields:fields,
+			Name:   table,
+			Id:     keyName,
+			Fields: fields,
 		}
 		rows.Close()
 	}
 	return result, nil
 }
-
-
 
 func getRows(db *sql.DB, table TableInfo, limit int, offset int) ([]interface{}, error) {
 	rows, err := db.Query(fmt.Sprintf("select * from %s limit %d offset %d", table.Name, limit, offset))
@@ -404,4 +490,3 @@ func getRows(db *sql.DB, table TableInfo, limit int, offset int) ([]interface{},
 
 	return result, nil
 }
-
